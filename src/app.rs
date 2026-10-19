@@ -11,7 +11,7 @@ use winit::keyboard::{Key, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 #[cfg(target_os = "macos")]
-use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::platform::macos::{WindowAttributesExtMacOS, WindowExtMacOS};
 
 use crate::history::{FileState, FitMode, History};
 use crate::pdf::{DocLink, PdfDoc, SearchHit};
@@ -921,6 +921,10 @@ impl ApplicationHandler for App {
         }
 
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
+        // Native drop-shadow sits outside the frame and hides JankyBorders' 3px stroke.
+        #[cfg(target_os = "macos")]
+        window.set_has_shadow(false);
+
         self.scale_factor = window.scale_factor();
         let size = window.inner_size();
         self.win_w = size.width;
