@@ -1311,6 +1311,7 @@ name = "riftpdf"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "libc",
  "mupdf",
  "raw-window-handle",
  "serde",
