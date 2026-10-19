@@ -7,30 +7,32 @@ use winit::application::ApplicationHandler;
 use winit::dpi::PhysicalSize;
 use winit::event::{ElementState, KeyEvent, MouseButton, MouseScrollDelta, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow};
-use winit::keyboard::{Key, NamedKey};
+use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{CursorIcon, Window, WindowId};
 
 #[cfg(target_os = "macos")]
 use winit::platform::macos::{WindowAttributesExtMacOS, WindowExtMacOS};
 
 use crate::history::{FileState, FitMode, History};
+use crate::layout::{self, clamp_scroll, page_at_y, rescale_center, zoom_best_fit, zoom_fit_width};
 use crate::pdf::{DocLink, PdfDoc, SearchHit};
+use crate::timing::PhaseLog;
 
-const STATUS_H: u32 = 22;
+const STATUS_H: u32 = 40;
 const PAGE_GAP: f32 = 12.0;
 const SCROLL_STEP: f32 = 48.0;
 const ZOOM_STEP: f32 = 1.1;
 const BG: u32 = 0x000e_1018;
 const STATUS_BG: u32 = 0x0014_161e;
-const STATUS_FG: u32 = 0x00c8_d0e0;
+const STATUS_FG: u32 = 0x00e8_eef8;
+const STATUS_DIM: u32 = 0x0080_8898;
 const HIGHLIGHT: u32 = 0x00d4_b878;
 const HIGHLIGHT_CUR: u32 = 0x00c4_6c78;
 const LINK_HL: u32 = 0x0080_c8e0;
 const LINK_HOVER: u32 = 0x0098_d8f0;
 const TOC_BG: u32 = 0x001e_2430;
 const TOC_SEL: u32 = 0x0080_c8e0;
-
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Mode {
     Normal,
     SearchInput,
@@ -81,12 +83,25 @@ pub struct App {
     show_links: bool,
     cursor: (f64, f64),
     hover_link: Option<DocLink>,
+    timing: PhaseLog,
+    /// `b` toggles the bottom status bar.
+    show_status: bool,
+    /// Latest modifier state (winit delivers this via `ModifiersChanged`).
+    modifiers: ModifiersState,
 }
 
 impl App {
     pub fn new(path: PathBuf) -> Result<Self, Box<dyn std::error::Error>> {
+        Self::new_with_history(path, History::load())
+    }
+
+    pub fn new_with_history(
+        path: PathBuf,
+        history: History,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let mut timing = PhaseLog::new();
         let doc = PdfDoc::open(&path)?;
-        let history = History::load();
+        timing.mark("pdf_open");
         // Always start with fit-width for a clean open in a tiled window.
         // Remember page index only — zoom is recomputed for the real window size.
         let page = history
@@ -95,6 +110,7 @@ impl App {
             .unwrap_or(0);
 
         let _ = doc.page_size(page)?;
+        timing.mark("page_size");
 
         Ok(Self {
             path,
@@ -125,6 +141,9 @@ impl App {
             show_links: false,
             cursor: (0.0, 0.0),
             hover_link: None,
+            timing,
+            show_status: true,
+            modifiers: ModifiersState::empty(),
         })
     }
 
@@ -152,6 +171,57 @@ impl App {
             self.doc.page_count(),
             self.zoom * 100.0
         )
+    }
+
+    fn content_h(&self) -> f32 {
+        if self.show_status {
+            self.win_h.saturating_sub(STATUS_H) as f32
+        } else {
+            self.win_h as f32
+        }
+    }
+
+    fn quit(&mut self, event_loop: &ActiveEventLoop) {
+        self.persist();
+        event_loop.exit();
+    }
+
+    fn half_page_px(&self) -> f32 {
+        (self.content_h() * 0.5).max(SCROLL_STEP)
+    }
+
+    fn page_px(&self) -> f32 {
+        self.content_h().max(SCROLL_STEP)
+    }
+
+    fn handle_ctrl_motion(&mut self, key: &str) -> bool {
+        match key {
+            "d" => {
+                self.scroll_vertical(self.half_page_px());
+                true
+            }
+            "u" => {
+                self.scroll_vertical(-self.half_page_px());
+                true
+            }
+            "f" => {
+                self.scroll_vertical(self.page_px());
+                true
+            }
+            "b" => {
+                self.scroll_vertical(-self.page_px());
+                true
+            }
+            "e" => {
+                self.scroll_vertical(SCROLL_STEP);
+                true
+            }
+            "y" => {
+                self.scroll_vertical(-SCROLL_STEP);
+                true
+            }
+            _ => false,
+        }
     }
 
     fn request_redraw(&self) {
@@ -208,15 +278,18 @@ impl App {
     /// After zoom change, keep the document point that was in the middle of
     /// the viewport still centered (zoom-to-center, not top-left).
     fn rescale_scroll(&mut self, old_scale: f32, new_scale: f32) {
-        if old_scale > 0.0 && new_scale > 0.0 && (new_scale - old_scale).abs() > f32::EPSILON {
-            let ratio = new_scale / old_scale;
-            let view_w = self.win_w as f32;
-            let view_h = self.content_h();
-            let cx = self.scroll_x + view_w * 0.5;
-            let cy = self.scroll_y + view_h * 0.5;
-            self.scroll_x = cx * ratio - view_w * 0.5;
-            self.scroll_y = cy * ratio - view_h * 0.5;
-        }
+        let view_w = self.win_w as f32;
+        let view_h = self.content_h();
+        let (sx, sy) = rescale_center(
+            self.scroll_x,
+            self.scroll_y,
+            view_w,
+            view_h,
+            old_scale,
+            new_scale,
+        );
+        self.scroll_x = sx;
+        self.scroll_y = sy;
         self.invalidate_layout();
         self.clamp_scroll(true);
     }
@@ -239,12 +312,10 @@ impl App {
         let dpi = self.scale_factor as f32;
         match self.fit {
             FitMode::BestFit => {
-                let zx = view_w / (pw * dpi);
-                let zy = view_h / (ph * dpi);
-                self.zoom = zx.min(zy);
+                self.zoom = zoom_best_fit(view_w, view_h, pw, ph, dpi);
             }
             FitMode::FitWidth => {
-                self.zoom = view_w / (pw * dpi);
+                self.zoom = zoom_fit_width(view_w, pw, dpi);
             }
             FitMode::Manual => return,
         }
@@ -263,20 +334,21 @@ impl App {
         self.dirty = true;
     }
 
-    fn content_h(&self) -> f32 {
-        self.win_h.saturating_sub(STATUS_H) as f32
-    }
-
     fn clamp_scroll(&mut self, sync_page: bool) {
         self.ensure_layout();
         let Some(layout) = &self.layout else {
             return;
         };
-        let content_h = self.content_h();
-        let max_y = (layout.doc_height - content_h).max(0.0);
-        let max_x = (layout.max_width - self.win_w as f32).max(0.0);
-        self.scroll_y = self.scroll_y.clamp(0.0, max_y);
-        self.scroll_x = self.scroll_x.clamp(0.0, max_x);
+        let (sx, sy) = clamp_scroll(
+            self.scroll_x,
+            self.scroll_y,
+            layout.doc_height,
+            layout.max_width,
+            self.content_h(),
+            self.win_w as f32,
+        );
+        self.scroll_x = sx;
+        self.scroll_y = sy;
         if sync_page {
             self.sync_page_from_scroll();
         }
@@ -287,15 +359,10 @@ impl App {
         let Some(layout) = &self.layout else {
             return;
         };
-        let focus = self.scroll_y + self.content_h() * 0.25;
-        let mut page = 0usize;
-        for (i, &y) in layout.y_start.iter().enumerate() {
-            if y <= focus {
-                page = i;
-            } else {
-                break;
-            }
-        }
+        let page = page_at_y(
+            &layout.y_start,
+            layout::focus_y(self.scroll_y, self.content_h()),
+        );
         if page != self.page {
             self.page = page;
             self.persist();
@@ -547,7 +614,8 @@ impl App {
         let mode = self.mode;
         let show_links = self.show_links;
         let hover = self.hover_link.clone();
-        let status = self.status_line();
+        let (status_primary, status_hint) = self.status_line();
+        let show_status = self.show_status;
         let toc_sel = self.toc_sel;
         let toc_rows: Vec<(usize, String, usize, usize)> = if mode == Mode::Toc {
             self.filtered_toc()
@@ -657,46 +725,80 @@ impl App {
             draw_toc_panel(&mut buffer, w, content_hu, &toc_rows, toc_sel);
         }
 
-        for y in content_hu..h {
-            for x in 0..w {
-                buffer[(y * w + x) as usize] = STATUS_BG;
+        if show_status {
+            for y in content_hu..h {
+                for x in 0..w {
+                    buffer[(y * w + x) as usize] = STATUS_BG;
+                }
             }
+            // 2× bitmap font for readability
+            draw_text_5x7_scaled(
+                &mut buffer,
+                w,
+                h,
+                8,
+                content_hu + 4,
+                &status_primary,
+                STATUS_FG,
+                2,
+            );
+            draw_text_5x7_scaled(
+                &mut buffer,
+                w,
+                h,
+                8,
+                content_hu + 22,
+                &status_hint,
+                STATUS_DIM,
+                1,
+            );
         }
-        draw_text_5x7(&mut buffer, w, h, 6, content_hu + 7, &status, STATUS_FG);
 
         let _ = buffer.present();
         window.set_title(&self.title());
         self.dirty = false;
     }
 
-    fn status_line(&self) -> String {
+    fn status_line(&self) -> (String, String) {
+        // (primary, hint) — drawn as two rows when the bar is visible
         match self.mode {
-            Mode::SearchInput => format!(" /{}_", self.search_buf),
+            Mode::SearchInput => (
+                format!("/{}_", self.search_buf),
+                "Enter search · Esc cancel · n/N next".into(),
+            ),
             Mode::Toc => {
                 let n = self.filtered_toc().len();
                 if self.toc_filter.is_empty() {
-                    format!(" toc {n} chapters  (j/k Enter Esc)")
+                    (
+                        format!("TOC — {n} chapters"),
+                        "j/k move · Enter jump · type to filter · Esc".into(),
+                    )
                 } else {
-                    format!(" toc filter: {}_  ({n})", self.toc_filter)
+                    (
+                        format!("TOC filter: {}_ ({n})", self.toc_filter),
+                        "Enter jump · Esc clear".into(),
+                    )
                 }
             }
             Mode::Normal => {
-                if !self.status_msg.is_empty() {
-                    format!(" {}", truncate(&self.status_msg, 60))
+                let name = self
+                    .path
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("pdf");
+                let primary = if !self.status_msg.is_empty() {
+                    truncate(&self.status_msg, 52)
                 } else {
-                    let name = self
-                        .path
-                        .file_stem()
-                        .and_then(|s| s.to_str())
-                        .unwrap_or("pdf");
                     format!(
-                        " {}  {}/{}  {:.0}%",
-                        truncate(name, 28),
+                        "{}  {}/{}  {:.0}%",
+                        truncate(name, 24),
                         self.page + 1,
                         self.doc.page_count(),
                         self.zoom * 100.0
                     )
-                }
+                };
+                let hint = "hjkl · C-d/u · / search · n/N · q".into();
+                (primary, hint)
             }
         }
     }
@@ -720,12 +822,21 @@ impl App {
             Mode::Normal => {}
         }
 
+        if self.modifiers.control_key() {
+            if let Key::Character(c) = &event.logical_key {
+                if self.handle_ctrl_motion(c.as_str()) {
+                    self.request_redraw();
+                    return;
+                }
+            }
+        }
+
         let mut consumed_pending = false;
         match &event.logical_key {
             Key::Character(c) => match c.as_str() {
                 "q" => {
-                    self.persist();
-                    event_loop.exit();
+                    self.quit(event_loop);
+                    return;
                 }
                 "j" => self.scroll_vertical(SCROLL_STEP),
                 "k" => self.scroll_vertical(-SCROLL_STEP),
@@ -755,6 +866,14 @@ impl App {
                 }
                 "n" => self.next_hit(false),
                 "N" => self.next_hit(true),
+                "b" => {
+                    self.show_status = !self.show_status;
+                    self.clamp_scroll(false);
+                    if self.show_status {
+                        self.status_msg = "status bar on".into();
+                    }
+                    self.dirty = true;
+                }
                 "f" => {
                     self.show_links = !self.show_links;
                     self.status_msg = if self.show_links {
@@ -793,8 +912,8 @@ impl App {
                     self.status_msg.clear();
                     self.dirty = true;
                 } else {
-                    self.persist();
-                    event_loop.exit();
+                    self.quit(event_loop);
+                    return;
                 }
             }
             Key::Named(NamedKey::PageDown) => self.goto_page(self.page + 1),
@@ -906,6 +1025,17 @@ impl ApplicationHandler for App {
             return;
         }
 
+        // Seed size from the monitor so the first frame is closer to Rift's tile
+        // (avoids a tiny 450×550 flash before the WM places the window).
+        if let Some(monitor) = event_loop.primary_monitor() {
+            let size = monitor.size();
+            if size.width >= 640 && size.height >= 480 {
+                // Leave a little slack for SketchyBar / outer gaps; Rift will still resize.
+                self.win_w = size.width.saturating_sub(48);
+                self.win_h = size.height.saturating_sub(64);
+            }
+        }
+
         let mut attrs = Window::default_attributes()
             .with_title(self.title())
             .with_inner_size(PhysicalSize::new(self.win_w, self.win_h));
@@ -929,6 +1059,7 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         self.win_w = size.width;
         self.win_h = size.height;
+        self.timing.mark("window_created");
 
         let context = Context::new(window.clone()).expect("softbuffer context");
         let surface = Surface::new(&context, window.clone()).expect("softbuffer surface");
@@ -940,19 +1071,23 @@ impl ApplicationHandler for App {
         // Fit after we know size; Rift may still Resize immediately after —
         // Resized handler re-applies fit until the user zooms manually.
         self.apply_fit();
+        self.timing.mark("first_fit");
         self.request_redraw();
     }
 
     fn window_event(&mut self, event_loop: &ActiveEventLoop, _id: WindowId, event: WindowEvent) {
         match event {
             WindowEvent::CloseRequested => {
-                self.persist();
-                event_loop.exit();
+                self.quit(event_loop);
             }
             WindowEvent::RedrawRequested => self.redraw(),
             WindowEvent::Resized(size) => {
+                let prev = (self.win_w, self.win_h);
                 self.win_w = size.width;
                 self.win_h = size.height;
+                if prev != (self.win_w, self.win_h) {
+                    self.timing.mark("wm_resize");
+                }
                 if !self.user_zoomed && self.fit != FitMode::Manual {
                     self.apply_fit();
                 } else {
@@ -968,6 +1103,9 @@ impl ApplicationHandler for App {
                 self.rescale_scroll(old, new);
                 self.dirty = true;
                 self.request_redraw();
+            }
+            WindowEvent::ModifiersChanged(mods) => {
+                self.modifiers = mods.state();
             }
             WindowEvent::KeyboardInput { event, .. } => self.handle_key(event, event_loop),
             WindowEvent::CursorMoved { position, .. } => {
@@ -1091,10 +1229,20 @@ fn fill_rect_blend(
     color: u32,
     alpha: f32,
 ) {
-    let x0 = x0.max(0) as u32;
-    let y0 = y0.max(0) as u32;
-    let x1 = (x1 as u32).min(w);
-    let y1 = (y1 as u32).min(h);
+    // Clamp in signed space first. Casting a negative y1/x1 to u32 wraps to a
+    // huge value (e.g. -1 → u32::MAX), which then `.min(h)` still yields a
+    // full-height/width fill — that was the vertical search-highlight streaks.
+    let x0 = x0.max(0);
+    let y0 = y0.max(0);
+    let x1 = x1.min(w as i32);
+    let y1 = y1.min(h as i32);
+    if x1 <= x0 || y1 <= y0 {
+        return;
+    }
+    let x0 = x0 as u32;
+    let y0 = y0 as u32;
+    let x1 = x1 as u32;
+    let y1 = y1 as u32;
     for y in y0..y1 {
         for x in x0..x1 {
             let i = (y * w + x) as usize;
@@ -1106,16 +1254,17 @@ fn fill_rect_blend(
 }
 
 fn blend(dst: u32, src: u32, a: f32) -> u32 {
+    let a = a.clamp(0.0, 1.0);
     let dr = ((dst >> 16) & 0xff) as f32;
     let dg = ((dst >> 8) & 0xff) as f32;
     let db = (dst & 0xff) as f32;
     let sr = ((src >> 16) & 0xff) as f32;
     let sg = ((src >> 8) & 0xff) as f32;
     let sb = (src & 0xff) as f32;
-    let r = (dr * (1.0 - a) + sr * a) as u32;
-    let g = (dg * (1.0 - a) + sg * a) as u32;
-    let b = (db * (1.0 - a) + sb * a) as u32;
-    (r << 16) | (g << 8) | b
+    let r = (dr * (1.0 - a) + sr * a).round() as u32;
+    let g = (dg * (1.0 - a) + sg * a).round() as u32;
+    let b = (db * (1.0 - a) + sb * a).round() as u32;
+    (r.min(255) << 16) | (g.min(255) << 8) | b.min(255)
 }
 
 fn truncate(s: &str, max: usize) -> String {
@@ -1127,6 +1276,21 @@ fn truncate(s: &str, max: usize) -> String {
 }
 
 fn draw_text_5x7(buf: &mut [u32], w: u32, h: u32, x0: u32, y0: u32, text: &str, color: u32) {
+    draw_text_5x7_scaled(buf, w, h, x0, y0, text, color, 1);
+}
+
+#[allow(clippy::too_many_arguments)]
+fn draw_text_5x7_scaled(
+    buf: &mut [u32],
+    w: u32,
+    h: u32,
+    x0: u32,
+    y0: u32,
+    text: &str,
+    color: u32,
+    scale: u32,
+) {
+    let scale = scale.max(1);
     let mut x = x0;
     for ch in text.chars() {
         if let Some(glyph) = glyph5x7(ch) {
@@ -1134,17 +1298,21 @@ fn draw_text_5x7(buf: &mut [u32], w: u32, h: u32, x0: u32, y0: u32, text: &str, 
                 let bits = glyph[row as usize];
                 for col in 0..5u32 {
                     if bits & (1 << (4 - col)) != 0 {
-                        let px = x + col;
-                        let py = y0 + row;
-                        if px < w && py < h {
-                            buf[(py * w + px) as usize] = color;
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                let px = x + col * scale + dx;
+                                let py = y0 + row * scale + dy;
+                                if px < w && py < h {
+                                    buf[(py * w + px) as usize] = color;
+                                }
+                            }
                         }
                     }
                 }
             }
         }
-        x += 6;
-        if x + 5 >= w {
+        x += 6 * scale;
+        if x + 5 * scale >= w {
             break;
         }
     }
@@ -1203,4 +1371,156 @@ fn glyph5x7(ch: char) -> Option<[u8; 7]> {
         'Z' | 'z' => g([0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F]),
         _ => g([0x1F, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1F]),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::PathBuf;
+
+    fn hello() -> PathBuf {
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/hello.pdf")
+    }
+
+    fn temp_history() -> History {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("riftpdf-app-hist-{nanos}.json"));
+        let _ = std::fs::remove_file(&path);
+        History::load_from(path)
+    }
+
+    fn app_at(w: u32, h: u32) -> App {
+        let mut app = App::new_with_history(hello(), temp_history()).expect("open fixture");
+        app.win_w = w;
+        app.win_h = h;
+        app.scale_factor = 1.0;
+        app
+    }
+
+    #[test]
+    fn opens_fixture() {
+        let app = App::new_with_history(hello(), temp_history()).expect("open");
+        assert_eq!(app.doc.page_count(), 2);
+        assert_eq!(app.fit, FitMode::FitWidth);
+    }
+
+    #[test]
+    fn restores_page_from_history_on_open() {
+        let path = hello();
+        let mut hist = temp_history();
+        hist.save(
+            &path,
+            FileState {
+                page: 1,
+                zoom: 1.0,
+                fit: FitMode::FitWidth,
+            },
+        );
+        let app = App::new_with_history(path, hist).expect("open");
+        assert_eq!(app.page, 1);
+    }
+
+    #[test]
+    fn apply_fit_width_sets_zoom_from_page_size() {
+        let mut app = app_at(600, 800);
+        app.fit = FitMode::FitWidth;
+        app.page = 0;
+        app.apply_fit();
+        let (pw, _) = app.doc.page_size(0).unwrap();
+        let expected = zoom_fit_width(600.0, pw, 1.0);
+        assert!((app.zoom - expected).abs() < 1e-4);
+    }
+
+    #[test]
+    fn apply_fit_preserves_page() {
+        let mut app = app_at(600, 800);
+        app.page = 1;
+        app.fit = FitMode::FitWidth;
+        app.apply_fit();
+        assert_eq!(app.page, 1);
+        assert!(app.scroll_y > 0.0, "page 1 should not sit at scroll_y=0");
+    }
+
+    #[test]
+    fn goto_page_updates_scroll_and_page() {
+        let mut app = app_at(600, 800);
+        app.apply_fit();
+        app.goto_page(1);
+        assert_eq!(app.page, 1);
+        let y1 = app.layout.as_ref().unwrap().y_start[1];
+        assert!((app.scroll_y - y1).abs() < 1.0);
+    }
+
+    #[test]
+    fn scroll_vertical_clamps_and_syncs_page() {
+        let mut app = app_at(600, 800);
+        app.apply_fit();
+        app.scroll_vertical(10_000.0);
+        let layout = app.layout.as_ref().unwrap();
+        let max_y = (layout.doc_height - app.content_h()).max(0.0);
+        assert!((app.scroll_y - max_y).abs() < 1e-3);
+        assert_eq!(app.page, app.doc.page_count() - 1);
+    }
+
+    #[test]
+    fn zoom_by_marks_manual_and_user_zoomed() {
+        let mut app = app_at(600, 800);
+        app.apply_fit();
+        let before = app.zoom;
+        app.zoom_by(ZOOM_STEP);
+        assert!(app.user_zoomed);
+        assert_eq!(app.fit, FitMode::Manual);
+        assert!(app.zoom > before);
+    }
+
+    #[test]
+    fn title_includes_page_and_zoom() {
+        let mut app = app_at(600, 800);
+        app.page = 0;
+        app.zoom = 1.5;
+        let t = app.title();
+        assert!(t.contains("[1/2]"));
+        assert!(t.contains("150%"));
+    }
+
+    #[test]
+    fn content_h_respects_status_toggle() {
+        let mut app = app_at(600, 800);
+        assert_eq!(app.content_h(), (800 - STATUS_H) as f32);
+        app.show_status = false;
+        assert_eq!(app.content_h(), 800.0);
+    }
+
+    #[test]
+    fn fill_rect_blend_skips_fully_offscreen_negative_y() {
+        // Regression: negative y1 cast to u32 used to wrap and fill the whole buffer.
+        let w = 40u32;
+        let h = 60u32;
+        let mut buf = vec![0u32; (w * h) as usize];
+        fill_rect_blend(&mut buf, w, h, 10, -200, 20, -100, 0x00ff_0000, 1.0);
+        assert!(
+            buf.iter().all(|&p| p == 0),
+            "off-screen rect must not paint"
+        );
+    }
+
+    #[test]
+    fn fill_rect_blend_clips_partially_visible() {
+        let w = 40u32;
+        let h = 60u32;
+        let mut buf = vec![0u32; (w * h) as usize];
+        // Rect straddles the top edge: only y=0..5 should be painted.
+        fill_rect_blend(&mut buf, w, h, 5, -5, 8, 5, 0x00ff_0000, 1.0);
+        let painted = buf.iter().filter(|&&p| p != 0).count();
+        assert_eq!(painted, 3 * 5); // width 3, height 5
+                                    // Nothing below y=5
+        for y in 5..h {
+            for x in 0..w {
+                assert_eq!(buf[(y * w + x) as usize], 0);
+            }
+        }
+    }
 }
