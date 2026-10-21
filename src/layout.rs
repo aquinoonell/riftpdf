@@ -71,6 +71,12 @@ pub fn clamp_scroll(
     (scroll_x.clamp(0.0, max_x), scroll_y.clamp(0.0, max_y))
 }
 
+/// Horizontal pan that puts the page in the middle of the viewport.
+/// Zero when the page is narrower than the window (draw path centers those).
+pub fn center_scroll_x(max_width: f32, win_w: f32) -> f32 {
+    (max_width - win_w).max(0.0) * 0.5
+}
+
 /// Continuous-document Y offsets for pages of the given heights (device pixels).
 pub fn y_starts(heights: &[f32], page_gap: f32) -> (Vec<f32>, f32) {
     let mut y_start = Vec::with_capacity(heights.len());
@@ -121,6 +127,12 @@ mod tests {
         let (sx, sy) = clamp_scroll(-10.0, 5000.0, 1000.0, 800.0, 400.0, 600.0);
         assert!((sx - 0.0).abs() < 1e-5);
         assert!((sy - 600.0).abs() < 1e-5); // max_y = 1000 - 400
+    }
+
+    #[test]
+    fn center_scroll_x_is_half_overflow() {
+        assert!((center_scroll_x(400.0, 600.0) - 0.0).abs() < 1e-5);
+        assert!((center_scroll_x(1200.0, 600.0) - 300.0).abs() < 1e-5);
     }
 
     #[test]

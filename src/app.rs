@@ -14,7 +14,9 @@ use winit::window::{CursorIcon, Window, WindowId};
 use winit::platform::macos::{WindowAttributesExtMacOS, WindowExtMacOS};
 
 use crate::history::{FileState, FitMode, History};
-use crate::layout::{self, clamp_scroll, page_at_y, rescale_center, zoom_best_fit, zoom_fit_width};
+use crate::layout::{
+    self, center_scroll_x, clamp_scroll, page_at_y, rescale_center, zoom_best_fit, zoom_fit_width,
+};
 use crate::pdf::{DocLink, PdfDoc, SearchHit};
 use crate::timing::PhaseLog;
 
@@ -62,6 +64,9 @@ pub struct App {
     fit: FitMode,
     /// True after +/- so resize won't clobber the user's zoom.
     user_zoomed: bool,
+    /// After the initial tile fit (or an explicit `a`/`s`/`+/-`), keep zoom
+    /// across window resizes so layout switches don't reflow the page.
+    zoom_locked: bool,
     /// Horizontal pan in device pixels (sticky across pages).
     scroll_x: f32,
     /// Vertical offset into the continuous document (device pixels).
@@ -88,6 +93,13 @@ pub struct App {
     show_status: bool,
     /// Latest modifier state (winit delivers this via `ModifiersChanged`).
     modifiers: ModifiersState,
+    /// Inner size at window creation (pre-tile). The first Rift resize differs.
+    created_size: (u32, u32),
+    wm_resizes: u32,
+    /// Still waiting for the tiler to assign a real pane before locking zoom.
+    pending_tile: bool,
+    /// Manual zoom from the previous session, applied once the pane size is real.
+    saved_zoom: Option<f32>,
 }
 
 impl App {
@@ -102,12 +114,20 @@ impl App {
         let mut timing = PhaseLog::new();
         let doc = PdfDoc::open(&path)?;
         timing.mark("pdf_open");
-        // Always start with fit-width for a clean open in a tiled window.
-        // Remember page index only — zoom is recomputed for the real window size.
-        let page = history
-            .get(&path)
+        // Remember page always. Restore zoom only if the user had zoomed
+        // manually — fit-width is recomputed against the real tiled pane.
+        let saved = history.get(&path).cloned();
+        let page = saved
+            .as_ref()
             .map(|st| st.page.min(doc.page_count().saturating_sub(1)))
             .unwrap_or(0);
+        let saved_zoom = saved.and_then(|st| {
+            if st.fit == FitMode::Manual && st.zoom > 0.05 {
+                Some(st.zoom)
+            } else {
+                None
+            }
+        });
 
         let _ = doc.page_size(page)?;
         timing.mark("page_size");
@@ -123,6 +143,7 @@ impl App {
             zoom: 1.0,
             fit: FitMode::FitWidth,
             user_zoomed: false,
+            zoom_locked: false,
             scroll_x: 0.0,
             scroll_y: 0.0,
             pending_g: false,
@@ -144,6 +165,10 @@ impl App {
             timing,
             show_status: true,
             modifiers: ModifiersState::empty(),
+            created_size: (900, 1100),
+            wm_resizes: 0,
+            pending_tile: true,
+            saved_zoom,
         })
     }
 
@@ -324,14 +349,69 @@ impl App {
         self.invalidate_layout();
         self.ensure_layout();
         self.page = keep_page;
-        self.scroll_x = 0.0;
         self.scroll_y = self
             .layout
             .as_ref()
             .and_then(|l| l.y_start.get(keep_page).copied())
             .unwrap_or(0.0);
+        self.center_page_horizontally();
         self.clamp_scroll(false);
         self.dirty = true;
+    }
+
+    fn center_page_horizontally(&mut self) {
+        self.ensure_layout();
+        let max_width = self.layout.as_ref().map(|l| l.max_width).unwrap_or(0.0);
+        self.scroll_x = center_scroll_x(max_width, self.win_w as f32);
+    }
+
+    fn restore_saved_zoom(&mut self, zoom: f32) {
+        self.zoom = zoom.clamp(0.1, 8.0);
+        self.fit = FitMode::Manual;
+        self.user_zoomed = true;
+        self.zoom_locked = true;
+        self.invalidate_layout();
+        self.ensure_layout();
+        let page = self.page;
+        self.scroll_y = self
+            .layout
+            .as_ref()
+            .and_then(|l| l.y_start.get(page).copied())
+            .unwrap_or(0.0);
+        self.center_page_horizontally();
+        self.clamp_scroll(false);
+        self.dirty = true;
+    }
+
+    /// Apply history zoom or fit-width once Rift has given us a real pane.
+    fn settle_view(&mut self) {
+        if let Some(z) = self.saved_zoom.take() {
+            self.restore_saved_zoom(z);
+        } else {
+            self.apply_fit();
+            self.lock_zoom_if_tiled();
+        }
+        self.pending_tile = false;
+    }
+
+    /// Fit once to the current window, then lock zoom so later resizes (tiler
+    /// layout flips) keep the same magnification.
+    fn fit_and_lock(&mut self, mode: FitMode) {
+        self.user_zoomed = false;
+        self.fit = mode;
+        self.apply_fit();
+        if self.win_w >= 200 && self.win_h >= 200 {
+            self.zoom_locked = true;
+            self.fit = FitMode::Manual;
+        }
+        self.persist();
+    }
+
+    fn lock_zoom_if_tiled(&mut self) {
+        if self.win_w >= 200 && self.win_h >= 200 {
+            self.zoom_locked = true;
+            self.fit = FitMode::Manual;
+        }
     }
 
     fn clamp_scroll(&mut self, sync_page: bool) {
@@ -402,6 +482,7 @@ impl App {
         let old = self.render_scale();
         self.fit = FitMode::Manual;
         self.user_zoomed = true;
+        self.zoom_locked = true;
         self.zoom = (self.zoom * factor).clamp(0.1, 8.0);
         let new = self.render_scale();
         self.rescale_scroll(old, new);
@@ -846,18 +927,8 @@ impl App {
                 "K" => self.goto_page(self.page.saturating_sub(1)),
                 "+" | "=" => self.zoom_by(ZOOM_STEP),
                 "-" => self.zoom_by(1.0 / ZOOM_STEP),
-                "a" => {
-                    self.user_zoomed = false;
-                    self.fit = FitMode::BestFit;
-                    self.apply_fit();
-                    self.persist();
-                }
-                "s" => {
-                    self.user_zoomed = false;
-                    self.fit = FitMode::FitWidth;
-                    self.apply_fit();
-                    self.persist();
-                }
+                "a" => self.fit_and_lock(FitMode::BestFit),
+                "s" => self.fit_and_lock(FitMode::FitWidth),
                 "/" => {
                     self.mode = Mode::SearchInput;
                     self.search_buf.clear();
@@ -1059,6 +1130,9 @@ impl ApplicationHandler for App {
         let size = window.inner_size();
         self.win_w = size.width;
         self.win_h = size.height;
+        self.created_size = (self.win_w, self.win_h);
+        self.wm_resizes = 0;
+        self.pending_tile = true;
         self.timing.mark("window_created");
 
         let context = Context::new(window.clone()).expect("softbuffer context");
@@ -1068,8 +1142,8 @@ impl ApplicationHandler for App {
         self.surface = Some(surface);
         self.window = Some(window);
 
-        // Fit after we know size; Rift may still Resize immediately after —
-        // Resized handler re-applies fit until the user zooms manually.
+        // Fit to the creation size for the first frame, but do not lock —
+        // Rift's follow-up resize is the real pane (see Resized / settle_view).
         self.apply_fit();
         self.timing.mark("first_fit");
         self.request_redraw();
@@ -1085,11 +1159,24 @@ impl ApplicationHandler for App {
                 let prev = (self.win_w, self.win_h);
                 self.win_w = size.width;
                 self.win_h = size.height;
+                self.wm_resizes = self.wm_resizes.saturating_add(1);
                 if prev != (self.win_w, self.win_h) {
                     self.timing.mark("wm_resize");
                 }
-                if !self.user_zoomed && self.fit != FitMode::Manual {
+                let tiled = self.win_w >= 200 && self.win_h >= 200;
+                let moved = (self.win_w, self.win_h) != self.created_size;
+                // Creation size is a placeholder (900×1100). Wait until Rift
+                // actually tiles, or a second resize if the pane matched.
+                let can_settle = self.pending_tile && tiled && (moved || self.wm_resizes >= 2);
+                if can_settle {
+                    self.settle_view();
+                } else if self.pending_tile {
+                    if self.saved_zoom.is_none() {
+                        self.apply_fit();
+                    }
+                } else if !self.zoom_locked && !self.user_zoomed && self.fit != FitMode::Manual {
                     self.apply_fit();
+                    self.lock_zoom_if_tiled();
                 } else {
                     self.clamp_scroll(true);
                 }
@@ -1421,6 +1508,58 @@ mod tests {
         );
         let app = App::new_with_history(path, hist).expect("open");
         assert_eq!(app.page, 1);
+        assert!(app.saved_zoom.is_none());
+    }
+
+    #[test]
+    fn settle_restores_manual_zoom_centered() {
+        let path = hello();
+        let mut hist = temp_history();
+        hist.save(
+            &path,
+            FileState {
+                page: 0,
+                zoom: 2.5,
+                fit: FitMode::Manual,
+            },
+        );
+        let mut app = App::new_with_history(path, hist).expect("open");
+        app.win_w = 600;
+        app.win_h = 800;
+        app.scale_factor = 1.0;
+        assert!((app.saved_zoom.unwrap() - 2.5).abs() < 1e-4);
+        app.settle_view();
+        assert!((app.zoom - 2.5).abs() < 1e-4);
+        assert!(app.user_zoomed);
+        assert!(app.zoom_locked);
+        assert_eq!(app.fit, FitMode::Manual);
+        app.ensure_layout();
+        let max_w = app.layout.as_ref().unwrap().max_width;
+        let expected = center_scroll_x(max_w, 600.0);
+        assert!(
+            (app.scroll_x - expected).abs() < 1.0,
+            "zoomed reopen must center horizontally, got {} want {}",
+            app.scroll_x,
+            expected
+        );
+        assert!(app.scroll_x > 0.0, "2.5× zoom on a 600px pane should pan");
+    }
+
+    #[test]
+    fn apply_fit_centers_when_page_wider_than_window() {
+        let mut app = app_at(600, 800);
+        app.fit = FitMode::FitWidth;
+        app.apply_fit();
+        // Fit-width: page ≈ window, no horizontal pan needed.
+        assert!(app.scroll_x.abs() < 1.0);
+
+        app.zoom_by(2.0);
+        app.center_page_horizontally();
+        app.ensure_layout();
+        let max_w = app.layout.as_ref().unwrap().max_width;
+        let expected = center_scroll_x(max_w, 600.0);
+        assert!((app.scroll_x - expected).abs() < 1.0);
+        assert!(app.scroll_x > 0.0);
     }
 
     #[test]
@@ -1472,8 +1611,56 @@ mod tests {
         let before = app.zoom;
         app.zoom_by(ZOOM_STEP);
         assert!(app.user_zoomed);
+        assert!(app.zoom_locked);
         assert_eq!(app.fit, FitMode::Manual);
         assert!(app.zoom > before);
+    }
+
+    #[test]
+    fn fit_and_lock_keeps_zoom_across_resize() {
+        let mut app = app_at(600, 800);
+        app.fit_and_lock(FitMode::FitWidth);
+        let locked = app.zoom;
+        assert!(app.zoom_locked);
+        assert_eq!(app.fit, FitMode::Manual);
+
+        // Simulate a tiler layout flip to a wider pane, then back.
+        app.win_w = 1200;
+        if !app.zoom_locked && !app.user_zoomed && app.fit != FitMode::Manual {
+            app.apply_fit();
+        } else {
+            app.clamp_scroll(true);
+        }
+        assert!(
+            (app.zoom - locked).abs() < 1e-4,
+            "wider resize must not change zoom"
+        );
+
+        app.win_w = 600;
+        if !app.zoom_locked && !app.user_zoomed && app.fit != FitMode::Manual {
+            app.apply_fit();
+        } else {
+            app.clamp_scroll(true);
+        }
+        assert!(
+            (app.zoom - locked).abs() < 1e-4,
+            "return to side-by-side must keep zoom"
+        );
+    }
+
+    #[test]
+    fn s_refits_then_locks_at_new_width() {
+        let mut app = app_at(600, 800);
+        app.fit_and_lock(FitMode::FitWidth);
+        let side_by_side = app.zoom;
+
+        app.win_w = 1200;
+        app.fit_and_lock(FitMode::FitWidth);
+        assert!(
+            app.zoom > side_by_side,
+            "fit-width on a wider pane should raise zoom"
+        );
+        assert!(app.zoom_locked);
     }
 
     #[test]

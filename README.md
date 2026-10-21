@@ -47,12 +47,12 @@ By default the process detaches from the terminal. Use `--foreground` / `-f` to 
 
 - Continuous vertical scroll
 - Sticky zoom and pan (zoom toward center)
-- Fit-width on open; re-fits when the window is tiled or resized
+- Fit-width on open, then locks zoom so tiler layout switches keep magnification (`s` / `a` re-fit)
 - Search with on-screen highlights (`/` · `n` / `N`)
 - Table of contents (`t`)
 - Clickable links (internal jumps; `https` / `mailto` via macOS `open`)
 - Link highlights (`f` toggles all; hover always highlights)
-- Remembers last page per file
+- Remembers last page and manual zoom per file (reopens zoomed pages centered)
 - Borderless window (drag from anywhere); native shadow disabled so JankyBorders remain visible
 
 ## Keys
@@ -67,7 +67,7 @@ By default the process detaches from the terminal. Use `--foreground` / `-f` to 
 | `J` `K` / Space / PgUp / PgDn | Jump page |
 | `gg` / `G` | First / last page |
 | `+` `-` | Zoom in / out (centered) |
-| `a` / `s` | Best-fit / fit-width |
+| `a` / `s` | Best-fit / fit-width (once, then lock) |
 | `/` | Search |
 | `n` / `N` | Next / previous match |
 | `b` | Toggle status bar |
